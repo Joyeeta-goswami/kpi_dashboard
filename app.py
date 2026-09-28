@@ -125,10 +125,221 @@ def generate_demo_data(n_orders: int = 5000) -> dict:
 
 
 # =============================================================================
+# DATASET STATE — one active dataset shared by every dashboard page
+# =============================================================================
+# The upload page writes the cleaned dataframe into st.session_state; main()
+# reads it back from there, so all pages see the same data. If nothing has been
+# uploaded, the demo data is used.
+ACTIVE_KEY  = "active_df"       # uploaded + normalised dataframe (absent → demo data)
+SOURCE_KEY  = "active_source"   # label shown in the sidebar
+VERSION_KEY = "data_version"    # bumped on every load/reset so filter widgets reset
+
+REQUIRED_COLUMNS = ["order_id", "customer_id", "order_date"]
+
+# Common alternative column names → the names the dashboard pages expect
+COLUMN_ALIASES = {
+    "orderid": "order_id", "customerid": "customer_id", "productid": "product_id",
+    "date": "order_date", "orderdate": "order_date", "order_datetime": "order_date",
+    "product_name": "product", "category_name": "category",
+    "shipping_city": "city", "shipping_state": "state",
+    "payment": "payment_method", "order_status": "status",
+}
+
+TEXT_DEFAULTS = {
+    "product": "Unknown", "category": "Unknown", "city": "Unknown", "state": "Unknown",
+    "region": "Unknown", "payment_method": "Unknown", "status": "Delivered",
+}
+
+NUMERIC_COLS = ["quantity", "unit_price", "discount_pct", "cost_price", "gross_revenue",
+                "discount_amount", "net_revenue", "gross_profit", "total_amount"]
+
+
+def _clean_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Lowercase / snake_case column names and apply known aliases."""
+    df = df.copy()
+    df.columns = (df.columns.astype(str).str.strip().str.lower()
+                  .str.replace(r"[\s\-]+", "_", regex=True))
+    rename = {k: v for k, v in COLUMN_ALIASES.items() if k in df.columns and v not in df.columns}
+    return df.rename(columns=rename)
+
+
+def _parse_dates(series: pd.Series) -> tuple:
+    """Parse dates, retrying day-first (DD-MM-YYYY) if the default reading loses rows."""
+    default = pd.to_datetime(series, errors="coerce")
+    if default.notna().all():
+        return default, False
+    dayfirst = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    if dayfirst.notna().sum() > default.notna().sum():
+        return dayfirst, True
+    return default, False
+
+
+def _table_role(filename: str) -> str:
+    name = Path(filename).stem.lower()
+    if "item" in name:     return "order_items"
+    if "order" in name:    return "orders"
+    if "customer" in name: return "customers"
+    if "product" in name:  return "products"
+    return "other"
+
+
+def combine_tables(frames: dict) -> tuple:
+    """
+    Turn one or more uploaded CSVs into a single flat orders table.
+    - One file → used as-is (a ready-made flat orders file).
+    - orders / order_items / customers / products → joined on their shared keys.
+    Returns (dataframe, notes).
+    """
+    notes = []
+    if len(frames) == 1:
+        return _clean_columns(next(iter(frames.values()))), notes
+
+    tables = {}
+    for fname, raw in frames.items():
+        tables.setdefault(_table_role(fname), (fname, _clean_columns(raw)))
+
+    base_role = "order_items" if "order_items" in tables else "orders" if "orders" in tables else None
+    if base_role is None:
+        fname, base = max(tables.values(), key=lambda t: len(t[1]))
+        notes.append(f"Files didn't look like orders / order_items — using the largest file ({fname}).")
+        joined = [fname]
+    else:
+        fname, base = tables[base_role]
+        joined = [fname]
+
+    for role, key in [("orders", "order_id"), ("customers", "customer_id"), ("products", "product_id")]:
+        if role == base_role or role not in tables:
+            continue
+        rname, right = tables[role]
+        if key not in base.columns or key not in right.columns:
+            notes.append(f"Skipped {rname}: no shared '{key}' column to join on.")
+            continue
+        keep = [key] + [c for c in right.columns if c != key and c not in base.columns]
+        base = base.merge(right[keep].drop_duplicates(subset=key), on=key, how="left")
+        joined.append(rname)
+
+    notes.insert(0, "Joined: " + " + ".join(joined))
+    return base, notes
+
+
+def prepare_orders_frame(df: pd.DataFrame) -> tuple:
+    """
+    Validate an uploaded orders table and add every column the dashboard pages
+    rely on (revenue, profit, region, month_label, ...).
+    Returns (dataframe, notes). Raises ValueError with a readable message if the
+    file can't be used.
+    """
+    notes = []
+    df = _clean_columns(df)
+
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Missing required column(s): {', '.join(missing)}. "
+            f"Columns found: {', '.join(df.columns)}"
+        )
+
+    # Dates / keys
+    df["order_date"], dayfirst = _parse_dates(df["order_date"])
+    if dayfirst:
+        notes.append("Dates were read as day-first (DD-MM-YYYY).")
+    before = len(df)
+    df = df.dropna(subset=["order_date", "order_id", "customer_id"])
+    if len(df) < before:
+        notes.append(f"Dropped {before - len(df):,} rows with a missing/invalid order_id, customer_id or order_date.")
+    if df.empty:
+        raise ValueError("No valid rows left after removing missing order_id / customer_id / order_date.")
+
+    # Numbers
+    for c in NUMERIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "quantity" not in df.columns:
+        df["quantity"] = 1
+    df["quantity"] = df["quantity"].fillna(1)
+    if "discount_pct" not in df.columns:
+        df["discount_pct"] = 0.0
+    df["discount_pct"] = df["discount_pct"].fillna(0)
+
+    # Revenue
+    if "gross_revenue" not in df.columns and "unit_price" in df.columns:
+        df["gross_revenue"] = df["quantity"] * df["unit_price"]
+    if "discount_amount" not in df.columns:
+        df["discount_amount"] = (df["gross_revenue"] * df["discount_pct"] / 100
+                                 if "gross_revenue" in df.columns else 0.0)
+    df["discount_amount"] = df["discount_amount"].fillna(0)
+    if "net_revenue" not in df.columns:
+        if "gross_revenue" in df.columns:
+            df["net_revenue"] = df["gross_revenue"] - df["discount_amount"]
+        elif "total_amount" in df.columns:
+            df["net_revenue"] = df["total_amount"]
+        else:
+            raise ValueError(
+                "Couldn't find revenue columns. Include net_revenue, gross_revenue, "
+                "total_amount, or unit_price (+ quantity)."
+            )
+    if "gross_revenue" not in df.columns:
+        df["gross_revenue"] = df["net_revenue"] + df["discount_amount"]
+
+    # Profit
+    if "gross_profit" not in df.columns:
+        if "cost_price" in df.columns:
+            df["gross_profit"] = df["net_revenue"] - df["quantity"] * df["cost_price"]
+        else:
+            df["cost_price"] = np.nan
+            df["gross_profit"] = np.nan
+            notes.append("No cost_price / gross_profit column found — profit and margin will show as 0.")
+    elif "cost_price" not in df.columns:
+        df["cost_price"] = (df["net_revenue"] - df["gross_profit"]) / df["quantity"].replace(0, np.nan)
+
+    # Text columns the charts group by
+    filled = []
+    for col, default in TEXT_DEFAULTS.items():
+        if col not in df.columns:
+            df[col] = default
+            filled.append(col)
+        else:
+            df[col] = df[col].fillna(default).astype(str).str.strip()
+    df["status"] = df["status"].str.title()
+    if "status" in filled:
+        filled.remove("status")
+        notes.append("No status column — all orders are treated as Delivered.")
+    if filled:
+        notes.append("Columns not found, filled with 'Unknown': " + ", ".join(filled))
+
+    # Time helpers used by the pages
+    df["month"]       = df["order_date"].dt.to_period("M")
+    df["year"]        = df["order_date"].dt.year
+    df["month_label"] = df["order_date"].dt.strftime("%b %Y")
+
+    return df.sort_values("order_date").reset_index(drop=True), notes
+
+
+def get_active_data() -> tuple:
+    """Return (dataframe, source_label): the uploaded dataset if there is one, else demo data."""
+    df = st.session_state.get(ACTIVE_KEY)
+    if df is not None:
+        return df, st.session_state.get(SOURCE_KEY, "Uploaded dataset")
+    return generate_demo_data(5000)["orders"], "Demo data"
+
+
+def set_active_data(df: pd.DataFrame, source: str) -> None:
+    st.session_state[ACTIVE_KEY]  = df
+    st.session_state[SOURCE_KEY]  = source
+    st.session_state[VERSION_KEY] = st.session_state.get(VERSION_KEY, 0) + 1
+
+
+def reset_to_demo_data() -> None:
+    st.session_state.pop(ACTIVE_KEY, None)
+    st.session_state.pop(SOURCE_KEY, None)
+    st.session_state[VERSION_KEY] = st.session_state.get(VERSION_KEY, 0) + 1
+
+
+# =============================================================================
 # SIDEBAR — Filters and Navigation
 # =============================================================================
-def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
-    """Render the sidebar filters and return filtered dataframe."""
+def render_sidebar(df: pd.DataFrame, source: str = "Demo data") -> tuple:
+    """Render the sidebar filters and return (filtered dataframe, selected page)."""
     st.sidebar.image("https://via.placeholder.com/200x50?text=Analytics+Pro", width=200)
     st.sidebar.title("📊 Analytics Platform")
     st.sidebar.markdown("---")
@@ -139,27 +350,33 @@ def render_sidebar(df: pd.DataFrame) -> pd.DataFrame:
         ["🏠 Executive Overview", "💰 Revenue Analysis", "👥 Customer Analysis",
          "📦 Product Analysis", "🗺️ Regional Dashboard", "🔄 Retention Dashboard",
          "📤 Upload Dataset"],
-        index=0
+        index=0,
+        key="nav_page"
     )
 
     st.sidebar.markdown("---")
+    st.sidebar.caption(f"📁 Data source: **{source}**")
     st.sidebar.subheader("🔍 Global Filters")
+
+    # Filter widgets are keyed on the dataset version so they reset to the new
+    # dataset's full range whenever a dataset is loaded or reset.
+    ver = st.session_state.get(VERSION_KEY, 0)
 
     # Date range filter
     min_date = df["order_date"].min().date()
     max_date = df["order_date"].max().date()
 
     col1, col2 = st.sidebar.columns(2)
-    start_date = col1.date_input("From", min_date)
-    end_date   = col2.date_input("To",   max_date)
+    start_date = col1.date_input("From", min_date, key=f"from_{ver}")
+    end_date   = col2.date_input("To",   max_date, key=f"to_{ver}")
 
     # Category filter
     categories = ["All"] + sorted(df["category"].unique().tolist())
-    selected_cat = st.sidebar.multiselect("Category", categories[1:], default=categories[1:])
+    selected_cat = st.sidebar.multiselect("Category", categories[1:], default=categories[1:], key=f"cat_{ver}")
 
     # Region filter
     regions = ["All"] + sorted(df["region"].unique().tolist())
-    selected_region = st.sidebar.multiselect("Region", regions[1:], default=regions[1:])
+    selected_region = st.sidebar.multiselect("Region", regions[1:], default=regions[1:], key=f"reg_{ver}")
 
     # Apply filters
     mask = (
@@ -350,7 +567,7 @@ def page_customers(df: pd.DataFrame):
         cust_rev = delivered.groupby("customer_id")["net_revenue"].sum().reset_index()
         cust_rev.columns = ["customer_id", "total_spent"]
         cust_rev["segment"] = pd.qcut(
-            cust_rev["total_spent"], q=4,
+            cust_rev["total_spent"].rank(method="first"), q=4,
             labels=["Bronze (Low)", "Silver", "Gold", "Platinum (High)"]
         )
         seg_summary = cust_rev.groupby("segment").agg(
@@ -511,48 +728,103 @@ def page_retention(df: pd.DataFrame):
 # =============================================================================
 def page_upload():
     st.title("📤 Upload Your Dataset")
-    st.markdown("Upload your e-commerce CSV files to run the ETL pipeline.")
+    st.markdown(
+        "Upload your e-commerce CSV files, then click **Use this dataset** to load "
+        "them into every dashboard page."
+    )
+    st.caption(
+        "Upload either one flat orders file (needs `order_id`, `customer_id`, `order_date` plus "
+        "revenue columns), or a set of `orders.csv` / `order_items.csv` / `customers.csv` / "
+        "`products.csv` — related files are joined automatically."
+    )
+
+    # Current state
+    active = st.session_state.get(ACTIVE_KEY)
+    if active is not None:
+        st.success(
+            f"✅ Dashboards are using **{st.session_state.get(SOURCE_KEY, 'your upload')}** "
+            f"({len(active):,} rows)."
+        )
+        if st.button("↩️ Switch back to demo data"):
+            reset_to_demo_data()
+            st.rerun()
+    else:
+        st.info("Dashboards are currently showing the built-in demo data.")
 
     uploaded = st.file_uploader(
-        "Choose a CSV file",
+        "Choose CSV file(s)",
         type=["csv"],
         accept_multiple_files=True,
         help="Upload orders.csv, customers.csv, products.csv, or order_items.csv"
     )
+    if not uploaded:
+        return
 
-    if uploaded:
-        for file in uploaded:
-            df = pd.read_csv(file)
-            st.subheader(f"Preview: {file.name}")
-            st.write(f"Shape: {df.shape[0]:,} rows × {df.shape[1]} columns")
-            st.dataframe(df.head(10), use_container_width=True)
+    # Read every file
+    frames = {}
+    for file in uploaded:
+        try:
+            frames[file.name] = pd.read_csv(file)
+        except Exception as e:
+            st.error(f"Couldn't read {file.name}: {e}")
+    if not frames:
+        return
 
-            st.write("**Column Summary:**")
+    for name, raw in frames.items():
+        with st.expander(f"Preview: {name}  ({raw.shape[0]:,} rows × {raw.shape[1]} columns)"):
+            st.dataframe(raw.head(10), use_container_width=True)
             summary = pd.DataFrame({
-                "Type": df.dtypes,
-                "Non-Null": df.notnull().sum(),
-                "Null %": (df.isnull().mean() * 100).round(1),
-                "Unique": df.nunique()
+                "Type": raw.dtypes.astype(str),
+                "Non-Null": raw.notnull().sum(),
+                "Null %": (raw.isnull().mean() * 100).round(1),
+                "Unique": raw.nunique()
             })
             st.dataframe(summary, use_container_width=True)
 
-            if st.button(f"🚀 Run ETL for {file.name}"):
-                with st.spinner("Running pipeline..."):
-                    st.success("✅ Pipeline complete! Refresh dashboard to see updated data.")
+    # Combine + validate into the shape the dashboard pages expect
+    try:
+        combined, join_notes = combine_tables(frames)
+        prepared, prep_notes = prepare_orders_frame(combined)
+    except ValueError as e:
+        st.error(f"⚠️ This upload can't be used by the dashboards yet: {e}")
+        return
+
+    st.subheader("Dashboard-ready dataset")
+    st.write(
+        f"{len(prepared):,} rows · {prepared['order_id'].nunique():,} orders · "
+        f"{prepared['customer_id'].nunique():,} customers · "
+        f"{prepared['order_date'].min().date()} → {prepared['order_date'].max().date()}"
+    )
+    for note in join_notes + prep_notes:
+        st.warning(note) if ("not found" in note or "No " in note or "Skipped" in note
+                            or "Dropped" in note or "didn't" in note) else st.caption(note)
+    st.dataframe(prepared.head(10), use_container_width=True)
+
+    label = ", ".join(frames.keys())
+    if st.button("🚀 Use this dataset in all dashboard pages", type="primary"):
+        set_active_data(prepared, label)
+        st.rerun()
 
 
 # =============================================================================
 # MAIN APP ENTRY POINT
 # =============================================================================
 def main():
-    # Load data (demo or real DB)
-    data = generate_demo_data(5000)
-    df   = data["orders"]
+    # One dataset for the whole app: uploaded data if present, else demo data
+    df, source = get_active_data()
 
     # Sidebar filters
-    filtered_df, page = render_sidebar(df)
+    filtered_df, page = render_sidebar(df, source)
 
     # Route to the right page
+    if "Upload" in page:
+        page_upload()
+        return
+
+    if filtered_df.empty:
+        st.warning("No orders match the current filters — widen the date range, category or region.")
+        return
+
     if "Executive" in page:
         page_executive_overview(filtered_df)
     elif "Revenue" in page:
@@ -565,8 +837,6 @@ def main():
         page_regional(filtered_df)
     elif "Retention" in page:
         page_retention(filtered_df)
-    elif "Upload" in page:
-        page_upload()
 
 
 if __name__ == "__main__":
